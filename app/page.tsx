@@ -24,18 +24,20 @@ import {
 } from "@/components/ui/card"
 
 import { toast } from "@/components/ui/use-toast"
-import { useReactToPrint } from 'react-to-print';
 import { cn } from "@/lib/utils"
 import { ScrollArea } from "@radix-ui/react-scroll-area"
+import { useTheme } from "next-themes"
 import { Switch } from "@/components/ui/switch"
+import jsPDF from 'jspdf';
 
-// Replace the existing Supply type/interface definitions with this:
+// Update the Supply interface to use a fixed number for lowStock
 interface Supply {
   id: string;
   name: string;
   category: string;
   stock: number;
-  lowStock: number | boolean;
+  lowStock: boolean;
+  upc: string;
 }
 
 const categories = [
@@ -60,14 +62,15 @@ const categoryIcons = {
   // Add more icons as needed
 }
 
-// Add this new component before your main Home component
-const ThemeToggle = ({ theme, toggleTheme }: { theme: 'light' | 'dark', toggleTheme: () => void }) => {
+const ThemeToggle = () => {
+  const { theme, setTheme } = useTheme()
+
   return (
     <div className="flex items-center space-x-2">
       <Sun className="h-[1.2rem] w-[1.2rem] rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
       <Switch
         checked={theme === 'dark'}
-        onCheckedChange={toggleTheme}
+        onCheckedChange={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
       />
       <Moon className="h-[1.2rem] w-[1.2rem] rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
     </div>
@@ -79,17 +82,15 @@ export default function Home() {
   const [user, loading] = useAuthState(auth)
   const [searchTerm, setSearchTerm] = useState("")
   const [selectedCategory, setSelectedCategory] = useState("All categories")
-  const [scannedItem, setScannedItem] = useState("")
-  const [scanMode, setScanMode] = useState<"in" | "out">("in")
+  const [scannedUPC, setScannedUPC] = useState("")
   const [error, setError] = useState<string | null>(null)
   const router = useRouter()
   const [isAddingSupply, setIsAddingSupply] = useState(false)
   const [newSupplyName, setNewSupplyName] = useState("")
   const [newSupplyCategory, setNewSupplyCategory] = useState("")
   const [newSupplyStock, setNewSupplyStock] = useState("")
-  const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const [showOrderList, setShowOrderList] = useState(false)
-  const orderListRef = useRef(null)
+  const orderListRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (loading) return
@@ -97,85 +98,38 @@ export default function Home() {
     else fetchSupplies()
   }, [user, loading, router])
 
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark')
-  }, [theme])
-
   const fetchSupplies = async () => {
-    try {
-      const suppliesCollection = collection(db, 'supplies')
+    if (user && user.displayName) {
+      const suppliesCollection = collection(db, `sites/${user.displayName}/supplies`)
       const suppliesSnapshot = await getDocs(suppliesCollection)
       const suppliesList = suppliesSnapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data()
       })) as Supply[]
-      setSupplies(suppliesList.map(item => ({
-        ...item,
-        lowStock: item.stock <= (typeof item.lowStock === 'number' ? item.lowStock : 100)
-      })))
-    } catch (err) {
-      console.error("Error fetching supplies:", err)
-      setError("Failed to load supplies. Please try again later.")
+      setSupplies(suppliesList)
     }
   }
 
-  const addSupply = async (name: string, category: string, stock: number) => {
-    try {
-      await addDoc(collection(db, 'supplies'), {
-        name,
-        category,
-        stock: stock,
-        lowStock: stock < 100
-      })
-      toast({
-        title: "Supply Added",
-        description: `${name} has been added to the inventory.`,
-      })
-      fetchSupplies() // Refresh the list
-    } catch (err) {
-      console.error("Error adding supply:", err)
-      toast({
-        title: "Error",
-        description: "Failed to add supply. Please try again.",
-        variant: "destructive",
-      })
+  const addSupply = async (name: string, category: string, stock: number, upc?: string) => {
+    if (user && user.displayName) {
+      const suppliesCollection = collection(db, `sites/${user.displayName}/supplies`)
+      await addDoc(suppliesCollection, { name, category, stock, lowStock: stock <= 4, ...(upc && { upc }) })
+      fetchSupplies()
     }
   }
 
   const updateSupply = async (id: string, updatedData: Partial<Supply>) => {
-    try {
-      const supplyRef = doc(db, 'supplies', id)
+    if (user && user.displayName) {
+      const supplyRef = doc(db, `sites/${user.displayName}/supplies`, id)
       await updateDoc(supplyRef, updatedData)
-      toast({
-        title: "Supply Updated",
-        description: `The supply has been updated.`,
-      })
-      fetchSupplies() // Refresh the list
-    } catch (err) {
-      console.error("Error updating supply:", err)
-      toast({
-        title: "Error",
-        description: "Failed to update supply. Please try again.",
-        variant: "destructive",
-      })
+      fetchSupplies()
     }
   }
 
   const deleteSupply = async (id: string) => {
-    try {
-      await deleteDoc(doc(db, 'supplies', id))
-      toast({
-        title: "Supply Deleted",
-        description: `The supply has been removed from the inventory.`,
-      })
-      fetchSupplies() // Refresh the list
-    } catch (err) {
-      console.error("Error deleting supply:", err)
-      toast({
-        title: "Error",
-        description: "Failed to delete supply. Please try again.",
-        variant: "destructive",
-      })
+    if (user && user.displayName) {
+      await deleteDoc(doc(db, `sites/${user.displayName}/supplies`, id))
+      fetchSupplies()
     }
   }
 
@@ -188,32 +142,46 @@ export default function Home() {
   const lowStockCount = supplies.filter(supply => supply.lowStock).length
 
   const handleScan = async () => {
+    if (!scannedUPC) {
+      toast({
+        title: "Error",
+        description: "Please enter a UPC code.",
+        variant: "destructive",
+      })
+      return
+    }
+
     const suppliesCollection = collection(db, 'supplies')
-    const q = query(suppliesCollection, where("name", "==", scannedItem))
+    const q = query(suppliesCollection, where("upc", "==", scannedUPC))
     const querySnapshot = await getDocs(q)
     
     if (!querySnapshot.empty) {
+      // Item exists, update stock
       const item = querySnapshot.docs[0]
-      const itemData = item.data()
-      const newStock = scanMode === "in" ? itemData.stock + 1 : Math.max(0, itemData.stock - 1)
+      const itemData = item.data() as Supply
+      const newStock = itemData.stock + 1
       
       await updateSupply(item.id, { 
         stock: newStock,
-        lowStock: newStock < 100 // Example threshold
+        lowStock: newStock <= 4 // Set lowStock threshold to 4
       })
 
       toast({
-        title: `Item Scanned ${scanMode === "in" ? "In" : "Out"}`,
-        description: `${scanMode === "in" ? "Added" : "Removed"} 1 ${itemData.name} ${scanMode === "in" ? "to" : "from"} inventory. New stock: ${newStock}`,
+        title: "Item Scanned",
+        description: `Added 1 ${itemData.name} to inventory. New stock: ${newStock}`,
       })
     } else {
+      // Item doesn't exist, prompt for additional information
+      setIsAddingSupply(true)
+      setNewSupplyName("")
+      setNewSupplyCategory("")
+      setNewSupplyStock("1") // Set initial stock to 1
+
       toast({
-        title: "Error",
-        description: "Item not found in inventory.",
-        variant: "destructive",
+        title: "New Item",
+        description: "Please provide additional information for the new item.",
       })
     }
-    setScannedItem("")
   }
 
   // Function to handle user logout
@@ -226,15 +194,27 @@ export default function Home() {
     })
   }
 
-  // Function to toggle between light and dark themes
-  const toggleTheme = () => {
-    setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light')
-  }
-
-  // Setup for printing the order list
-  const handlePrint = useReactToPrint({
-    documentTitle: orderListRef.current || 'Order List',
-  });
+  // Add this new function to generate and save PDF
+  const handleSavePDF = () => {
+    if (orderListRef.current) {
+      const pdf = new jsPDF();
+      
+      pdf.text("Order List", 20, 20);
+      
+      let yOffset = 40;
+      sortedSupplies.filter(supply => supply.lowStock).forEach((supply) => {
+        pdf.text(`${supply.name} (${supply.category}) - ${supply.stock} in stock`, 20, yOffset);
+        yOffset += 10;
+        
+        if (yOffset > 280) {
+          pdf.addPage();
+          yOffset = 20;
+        }
+      });
+      
+      pdf.save("order-list.pdf");
+    }
+  };
 
   // Sort supplies by category and then by name
   const sortedSupplies = [...filteredSupplies].sort((a, b) => {
@@ -257,13 +237,13 @@ export default function Home() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-100 dark:bg-gray-900">
+    <div className="flex h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-white">
       {/* Sidebar */}
       <div className="w-64 bg-white dark:bg-gray-800 p-4 border-r dark:border-gray-700 flex flex-col">
         {/* App logo and title */}
         <div className="flex items-center space-x-2 mb-6">
           <Package className="h-6 w-6 text-blue-500" />
-          <h2 className="text-2xl font-bold dark:text-white">MedStock</h2>
+          <h2 className="text-2xl font-bold">MedStock</h2>
         </div>
         {/* Navigation menu */}
         <nav className="space-y-2 flex-grow">
@@ -313,32 +293,23 @@ export default function Home() {
               </CardHeader>
               <CardContent className="space-y-2">
                 <Input
-                  placeholder="Scan or enter item name"
-                  value={scannedItem}
-                  onChange={(e) => setScannedItem(e.target.value)}
+                  placeholder="Scan or enter UPC"
+                  value={scannedUPC}
+                  onChange={(e) => setScannedUPC(e.target.value)}
                 />
-                <Select value={scanMode} onValueChange={(value) => setScanMode(value as "in" | "out")}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Scan mode" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="in">Scan In</SelectItem>
-                    <SelectItem value="out">Scan Out</SelectItem>
-                  </SelectContent>
-                </Select>
                 <Button onClick={handleScan} className="w-full">Scan</Button>
               </CardContent>
             </Card>
           </div>
         </ScrollArea>
         {/* Made by Cody Beggs footer */}
-        <div className="mt-auto pt-4 pb-6 border-t border-gray-200 dark:border-gray-700">
+        <div className="mt-auto pt-4 pb-6 border-t border-gray-200">
           <div className="flex items-center justify-end space-x-2 text-sm">
-            <span className="text-gray-500 dark:text-gray-400">Crafted with</span>
+            <span className="text-gray-500">Crafted with</span>
             <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-red-500 animate-pulse" viewBox="0 0 20 20" fill="currentColor">
               <path fillRule="evenodd" d="M3.172 5.172a4 4 0 015.656 0L10 6.343l1.172-1.171a4 4 0 115.656 5.656L10 17.657l-6.828-6.829a4 4 0 010-5.656z" clipRule="evenodd" />
             </svg>
-            <span className="text-gray-500 dark:text-gray-400">by</span>
+            <span className="text-gray-500">by</span>
             <a 
               href="https://github.com/codybeggs" 
               target="_blank" 
@@ -356,16 +327,14 @@ export default function Home() {
         {/* Header */}
         <header className="bg-white dark:bg-gray-800 border-b dark:border-gray-700 p-4 shadow-sm">
           <div className="max-w-7xl mx-auto flex justify-between items-center">
-            <h1 className="text-2xl font-bold dark:text-white">Inventory</h1>
+            <h1 className="text-2xl font-bold">Inventory</h1>
             <div className="flex items-center space-x-4">
-              {/* Theme toggle switch */}
-              <ThemeToggle theme={theme} toggleTheme={toggleTheme} />
-              {/* Logout button */}
+              <ThemeToggle />
               <Button 
                 variant="outline" 
                 size="sm" 
                 onClick={handleLogout}
-                className={cn(theme === 'dark' && "text-white border-white hover:bg-white hover:text-gray-800")}
+                className="hover:bg-white hover:text-gray-800 dark:hover:bg-gray-700 dark:hover:text-white"
               >
                 <LogIn className="mr-2 h-4 w-4" />
                 Log out
@@ -375,8 +344,8 @@ export default function Home() {
         </header>
 
         {/* Content */}
-        <ScrollArea className="flex-1">
-          <main className="p-6">
+        <div className="flex-1 flex flex-col overflow-hidden bg-gray-100 dark:bg-gray-900">
+          <main className="p-6 flex flex-col h-full">
             {error && (
               <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
                 <strong className="font-bold">Error: </strong>
@@ -386,8 +355,8 @@ export default function Home() {
             {/* Header for Supplies section */}
             <div className="flex justify-between items-center mb-6">
               <div className="space-y-1">
-                <h2 className="text-2xl font-semibold tracking-tight dark:text-white">Supplies</h2>
-                <p className="text-sm text-muted-foreground dark:text-gray-300">Manage your urgent care inventory</p>
+                <h2 className="text-2xl font-semibold tracking-tight">Supplies</h2>
+                <p className="text-sm text-muted-foreground">Manage your urgent care inventory</p>
               </div>
               {/* Search, category filter, and add supply button */}
               <div className="flex items-center space-x-2">
@@ -397,19 +366,19 @@ export default function Home() {
                   <Input
                     type="search"
                     placeholder="Search supplies..."
-                    className="pl-8 w-[300px]"
+                    className="pl-8 w-[300px] dark:bg-gray-800 dark:text-white"
                     value={searchTerm}
                     onChange={(e) => setSearchTerm(e.target.value)}
                   />
                 </div>
                 {/* Category filter dropdown */}
                 <Select value={selectedCategory} onValueChange={setSelectedCategory}>
-                  <SelectTrigger className={cn("w-[180px]", theme === 'dark' && "text-white")}>
+                  <SelectTrigger className="w-[180px]">
                     <SelectValue placeholder="All categories" />
                   </SelectTrigger>
                   <SelectContent>
                     {categories.map((category) => (
-                      <SelectItem key={category} value={category} className={theme === 'dark' ? "text-white" : ""}>
+                      <SelectItem key={category} value={category}>
                         {category}
                       </SelectItem>
                     ))}
@@ -424,26 +393,43 @@ export default function Home() {
 
             {/* Add new supply form */}
             {isAddingSupply && (
-              <div className="mt-4 p-4 bg-white dark:bg-gray-800 rounded-lg shadow">
-                <h3 className="text-lg font-semibold mb-2 dark:text-white">Add New Supply</h3>
+              <div className="mt-4 p-4 bg-white dark:bg-gray-800 rounded-lg shadow mb-6 relative">
+                <button
+                  onClick={() => setIsAddingSupply(false)}
+                  className="absolute top-2 right-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+                <h3 className="text-lg font-semibold mb-2">
+                  {scannedUPC ? "Add Scanned Item" : "Add New Supply"}
+                </h3>
+                <Input
+                  placeholder="UPC"
+                  value={scannedUPC}
+                  onChange={(e) => setScannedUPC(e.target.value)}
+                  className="mb-2"
+                  disabled={!!scannedUPC}
+                />
                 {/* Supply name input */}
                 <Input
                   placeholder="Supply Name"
                   value={newSupplyName}
                   onChange={(e) => setNewSupplyName(e.target.value)}
-                  className={cn("mb-2", theme === 'dark' && "border border-gray-600")}
+                  className="mb-2 dark:bg-gray-700 dark:text-white"
                 />
                 {/* Supply category dropdown */}
                 <Select 
                   value={newSupplyCategory} 
                   onValueChange={setNewSupplyCategory}
                 >
-                  <SelectTrigger className={cn("mb-2", theme === 'dark' && "border border-gray-600 text-white")}>
+                  <SelectTrigger className="mb-2">
                     <SelectValue placeholder="Select a category" />
                   </SelectTrigger>
                   <SelectContent>
                     {categories.slice(1).map((category) => (
-                      <SelectItem key={category} value={category} className={theme === 'dark' ? "text-white" : ""}>
+                      <SelectItem key={category} value={category}>
                         {category}
                       </SelectItem>
                     ))}
@@ -455,20 +441,26 @@ export default function Home() {
                   placeholder="Initial Stock"
                   value={newSupplyStock}
                   onChange={(e) => setNewSupplyStock(e.target.value)}
-                  className={cn("mb-2", theme === 'dark' && "border border-gray-600")}
+                  className="mb-2"
                 />
                 {/* Add supply button */}
                 <Button onClick={() => {
                   if (newSupplyName && newSupplyCategory && newSupplyStock) {
-                    addSupply(newSupplyName, newSupplyCategory, parseInt(newSupplyStock))
+                    addSupply(
+                      newSupplyName, 
+                      newSupplyCategory, 
+                      parseInt(newSupplyStock), 
+                      scannedUPC || undefined // Pass undefined if scannedUPC is empty
+                    )
                     setIsAddingSupply(false)
                     setNewSupplyName("")
                     setNewSupplyCategory("")
                     setNewSupplyStock("")
+                    setScannedUPC("")
                   } else {
                     toast({
                       title: "Error",
-                      description: "Please fill in all fields.",
+                      description: "Please fill in all required fields.",
                       variant: "destructive",
                     })
                   }
@@ -478,96 +470,98 @@ export default function Home() {
               </div>
             )}
 
-            {/* Supply list */}
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
-              {/* Supply list header */}
-              <div className="grid grid-cols-5 gap-4 p-4 font-medium text-muted-foreground border-b dark:border-gray-700 dark:text-gray-300">
-                <div>Category</div>
-                <div>Name</div>
-                <div>Stock</div>
-                <div>Actions</div>
-                <div></div>
+            {/* Supply list - now in a scrollable container */}
+            <div className="flex-1 overflow-auto">
+              <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                {/* Supply list header */}
+                <div className="grid grid-cols-5 gap-4 p-4 font-medium text-muted-foreground border-b dark:border-gray-700 sticky top-0 bg-white dark:bg-gray-800 z-10">
+                  <div>Category</div>
+                  <div>Name</div>
+                  <div>Stock</div>
+                  <div>Actions</div>
+                  <div></div>
+                </div>
+                {/* Supply list items */}
+                {sortedSupplies.map((supply, index) => {
+                  const CategoryIcon = categoryIcons[supply.category as keyof typeof categoryIcons] || Package
+                  return (
+                    <div key={supply.id} className={cn(
+                      "grid grid-cols-5 gap-4 p-4 items-center",
+                      index % 2 === 0 ? "bg-gray-50 dark:bg-gray-700" : "bg-white dark:bg-gray-800"
+                    )}>
+                      {/* Supply category */}
+                      <div className="flex items-center space-x-2 text-muted-foreground">
+                        <CategoryIcon className="h-5 w-5" />
+                        <span>{supply.category}</span>
+                      </div>
+                      {/* Supply name */}
+                      <div className="font-medium">{supply.name}</div>
+                      {/* Supply stock */}
+                      <div>
+                        <Badge variant={supply.lowStock ? "destructive" : "secondary"}>
+                          {supply.stock} in stock
+                        </Badge>
+                      </div>
+                      {/* Stock adjustment buttons */}
+                      <div className="flex items-center space-x-2">
+                        <Button 
+                          variant="outline" 
+                          size="sm"
+                          onClick={() => updateSupply(supply.id, { stock: supply.stock - 1 })}
+                        >
+                          <Minus className="h-4 w-4" />
+                        </Button>
+                        <span className="w-8 text-center">{supply.stock}</span>
+                        <Button 
+                          variant="outline" 
+                          size="sm"
+                          onClick={() => updateSupply(supply.id, { stock: supply.stock + 1 })}
+                        >
+                          <Plus className="h-4 w-4" />
+                        </Button>
+                      </div>
+                      {/* Delete supply button */}
+                      <div>
+                        <Button 
+                          variant="destructive" 
+                          size="sm" 
+                          onClick={() => deleteSupply(supply.id)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
-              {/* Supply list items */}
-              {sortedSupplies.map((supply, index) => {
-                const CategoryIcon = categoryIcons[supply.category as keyof typeof categoryIcons] || Package
-                return (
-                  <div key={supply.id} className={cn(
-                    "grid grid-cols-5 gap-4 p-4 items-center",
-                    index % 2 === 0 ? "bg-gray-50 dark:bg-gray-800" : "bg-white dark:bg-gray-900"
-                  )}>
-                    {/* Supply category */}
-                    <div className="flex items-center space-x-2 text-muted-foreground dark:text-gray-300">
-                      <CategoryIcon className="h-5 w-5" />
-                      <span>{supply.category}</span>
-                    </div>
-                    {/* Supply name */}
-                    <div className="font-medium dark:text-white">{supply.name}</div>
-                    {/* Supply stock */}
-                    <div>
-                      <Badge variant={supply.lowStock ? "destructive" : "secondary"}>
-                        {supply.stock} in stock
-                      </Badge>
-                    </div>
-                    {/* Stock adjustment buttons */}
-                    <div className="flex items-center space-x-2">
-                      <Button 
-                        variant="outline" 
-                        size="sm"
-                        onClick={() => updateSupply(supply.id, { stock: supply.stock - 1 })}
-                        className={theme === 'dark' ? "text-white border-white" : ""}
-                      >
-                        <Minus className="h-4 w-4" />
-                      </Button>
-                      <span className={cn("w-8 text-center", theme === 'dark' && "text-white")}>{supply.stock}</span>
-                      <Button 
-                        variant="outline" 
-                        size="sm"
-                        onClick={() => updateSupply(supply.id, { stock: supply.stock + 1 })}
-                        className={theme === 'dark' ? "text-white border-white" : ""}
-                      >
-                        <Plus className="h-4 w-4" />
-                      </Button>
-                    </div>
-                    {/* Delete supply button */}
-                    <div>
-                      <Button 
-                        variant="destructive" 
-                        size="sm" 
-                        onClick={() => deleteSupply(supply.id)}
-                      >
-                        Delete
-                      </Button>
-                    </div>
-                  </div>
-                )
-              })}
             </div>
 
             {/* Order List Modal */}
             {showOrderList && (
               <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                <div ref={orderListRef} className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-lg max-w-2xl w-full">
-                  <h2 className="text-2xl font-bold mb-4 dark:text-white">Order List</h2>
-                  {/* List of low stock items */}
-                  <div className="mb-4">
-                    {sortedSupplies.filter(supply => supply.lowStock).map((supply) => (
-                      <div key={supply.id} className="flex justify-between items-center mb-2 dark:text-gray-300">
-                        <span>{supply.name} ({supply.category})</span>
-                        <span>{supply.stock} in stock</span>
-                      </div>
-                    ))}
+                <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-lg max-w-2xl w-full">
+                  <div ref={orderListRef}>
+                    <h2 className="text-2xl font-bold mb-4">Order List</h2>
+                    {/* List of low stock items */}
+                    <div className="mb-4">
+                      {sortedSupplies.filter(supply => supply.lowStock).map((supply) => (
+                        <div key={supply.id} className="flex justify-between items-center mb-2">
+                          <span>{supply.name} ({supply.category})</span>
+                          <span>{supply.stock} in stock</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   {/* Modal action buttons */}
                   <div className="flex justify-end space-x-2">
                     <Button onClick={() => setShowOrderList(false)}>Close</Button>
-                    <Button onClick={() => handlePrint()}>Print</Button>
+                    <Button onClick={handleSavePDF}>Save to PDF</Button>
                   </div>
                 </div>
               </div>
             )}
           </main>
-        </ScrollArea>
+        </div>
       </div>
     </div>
   )
