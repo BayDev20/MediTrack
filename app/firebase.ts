@@ -19,7 +19,7 @@ const db = getFirestore(app);
 export { auth, db };
 
 // Add a 'site' field to the user object
-interface User {
+export interface User {
   uid: string;
   email: string;
   site: string;

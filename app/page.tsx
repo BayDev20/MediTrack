@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { collection, getDocs, addDoc, updateDoc, doc, deleteDoc, query, where } from 'firebase/firestore'
 import { db, auth } from './firebase'
@@ -83,6 +83,7 @@ export default function Home() {
   const [searchTerm, setSearchTerm] = useState("")
   const [selectedCategory, setSelectedCategory] = useState("All categories")
   const [scannedUPC, setScannedUPC] = useState("")
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [error, setError] = useState<string | null>(null)
   const router = useRouter()
   const [isAddingSupply, setIsAddingSupply] = useState(false)
@@ -92,13 +93,7 @@ export default function Home() {
   const [showOrderList, setShowOrderList] = useState(false)
   const orderListRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    if (loading) return
-    if (!user) router.push('/login')
-    else fetchSupplies()
-  }, [user, loading, router])
-
-  const fetchSupplies = async () => {
+  const fetchSupplies = useCallback(async () => {
     if (user && user.displayName) {
       const suppliesCollection = collection(db, `sites/${user.displayName}/supplies`)
       const suppliesSnapshot = await getDocs(suppliesCollection)
@@ -108,7 +103,13 @@ export default function Home() {
       })) as Supply[]
       setSupplies(suppliesList)
     }
-  }
+  }, [user])
+
+  useEffect(() => {
+    if (loading) return
+    if (!user) router.push('/login')
+    else fetchSupplies()
+  }, [user, loading, router, fetchSupplies])
 
   const addSupply = async (name: string, category: string, stock: number, upc?: string) => {
     if (user && user.displayName) {
